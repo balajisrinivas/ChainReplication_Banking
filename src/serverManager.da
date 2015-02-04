@@ -1,0 +1,41 @@
+import sys
+import server
+
+class ServerManager(object):
+
+    #Function creates,sets up and starts a server chain of 'n' servers and associates the chain with the bank referred to by 'bankInfoMap'
+    #Returns the head and tail of the server chain
+    def createServerChain(self, n, bankInfoMap):
+        config(channel="fifo", clock='Lamport')
+        #Create the server chain
+        psSet = new(server.Server, num= n)
+        ps = list(psSet)
+        print(ps)
+        crashTypeList = bankInfoMap['crashTypeList']
+        #Setup the server chain
+        for i in range(len(ps)): 
+            if i==0:
+                serverType = "head"
+                pred = None
+                if i == len(ps)-1:
+                    succ = None
+                else:
+                    succ = ps[i+1]
+            elif i == len(ps)-1:
+                serverType = "tail"
+                pred = ps[i-1]
+                succ = None
+            else:
+                serverType = "mid"
+                pred = ps[i-1]
+                succ = ps[i+1]
+            bankInfoMap.update({'pred':pred,'succ':succ,'serverType':serverType,'register':True})
+            bankInfoMap['crashType'] = crashTypeList[i]
+            setup(ps[i], ({}, bankInfoMap))
+        #Start the server chain
+        start(psSet)
+        #Return the head and tail of the server chain
+        return ps
+    
+def main():
+    pass

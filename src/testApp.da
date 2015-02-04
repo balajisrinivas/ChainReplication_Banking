@@ -1,0 +1,57 @@
+import sys
+import serverManager
+import client
+import master
+import io
+import json
+import time
+from pprint import pprint
+
+class TestApp(object):
+
+    def __init__(self):
+        pass
+    
+    def trigger(self):
+        #Configure channel and clock parameters
+        config(channel="fifo", clock='Lamport')
+        sm = serverManager.ServerManager()
+        #Pathname of the configuration file
+        configPath = "C://Users//PearlWin//pythonspace//ChainReplicationP3//config//"+sys.argv[1]
+        json_data = open(configPath)
+        data=json.load(json_data)
+        numBanks = len(data["banks"])
+        clientReqDelay = data["clientWaitTime"]
+        simulateMessageLoss = data["simulate_msg_loss"]
+        extTailFailure = data["ext_tail_failure"]
+        
+        # master creation
+        masterSet = new(master.Master, num=1)
+        masterList = list(masterSet)
+        setup(masterList[0], ({},{'extTailFailure':extTailFailure}))
+        start(masterSet)
+        
+        #For each bank in the configuration file, create the server chain and also create,set up and start its clients
+        for i in range(numBanks):
+            numServers=data["banks"][i]["numServers"]
+            bankName=data["banks"][i]["bankName"]
+            numClients=data["banks"][i]["numClients"]
+            crashTypeList = data["banks"][i]["crashTypeList"]
+            # Creation of server chain for each bank
+            serverChain = sm.createServerChain(numServers,{'bankname':bankName, 'crashTypeList':crashTypeList, 'master':masterList[0], 'simulate_msg_loss':simulateMessageLoss})
+            head = serverChain[0]
+            tail = serverChain[len(serverChain)-1]
+            print("ServerManager : Server Chain for bank",bankName," : ",serverChain)
+            # Creation of clients
+            cSet = new(client.Client,num=numClients)
+            cList = list(cSet)
+            for j in range(len(cList)):
+                setup(cList[j], ({},{'bankname':bankName,'id':str(j),'head':head,'tail':tail, 'configPath':configPath, 
+                                     'delay':clientReqDelay, 'master':masterList[0]}))
+            start(cSet)
+        json_data.close()
+        
+        
+def main():
+    t = TestApp()
+    t.trigger()

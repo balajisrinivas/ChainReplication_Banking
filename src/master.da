@@ -1,0 +1,240 @@
+import sys
+import time
+import server
+import actionprocess
+
+class Master(process):
+    #Setup process for a server
+    def setup(ps, argsMap):
+        self.bankServersPingMap = {}
+        self.bankHeadTailMap = {}
+        self.bankClientsMap= {}
+        self.bankPredSuccMap= {}
+        
+        self.extTailFailure = argsMap['extTailFailure']
+        
+        self.chainThreshold = 3
+    
+    # Server registers itself with master
+    def receive(msg=('registerServer', bankName, serverType), from_=server):
+        updateBankHeadTailMap(bankName, server, serverType)
+        updateBankServersPingMap(bankName, server)
+     
+    # Client registers itself with master   
+    def receive(msg=('registerClient', bankName), from_=client):
+        if bankName in bankClientsMap:
+            clientList = bankClientsMap[bankName]
+            clientList.append(client)
+            bankClientsMap[bankName] = clientList
+        else:
+            bankClientsMap[bankName] = [client]
+     
+    # Server registers its pred and succ with master       
+    def receive(msg=('registerPredSucc', bankName, pred, succ), from_=server):
+        bankPredSuccMap[(bankName, server)] = (pred, succ)
+     
+    # receive pings from server and update the map       
+    def receive(msg=('pingMaster', bankName, server), from_ = serverWorker):
+        updateBankServersPingMap(bankName, server)
+        output("Master :  Received ping from server : ",server, " of bank : ",bankName)
+    
+    # Check for any servers had failed and take the crash handling action
+    def receive(msg='checkForFailedServers', from_ = masterWorker):
+        output("Master checking for failed servers")
+        currTs = round(time.time())
+        itbankServersPingMap = bankServersPingMap.copy()
+        for (bankName, serverPid) in itbankServersPingMap:
+            ts = itbankServersPingMap[(bankName, serverPid)]
+            if currTs - ts >= 5:
+                output("Master found a failed server : ",bankName, serverPid)
+                takeServerFailureAction(bankName, serverPid)
+     
+    # Check for chain length reduction beyond threshold           
+    def receive(msg='checkForChainLength', from_ = worker):
+        output("Master checking for chain length")
+        for bankName in bankHeadTailMap:
+            chainCount = getBankChainLength(bankName)
+            if chainCount <= self.chainThreshold:
+                extendServerChain(bankName)
+     
+    # S+ informs master to send sentRequests index to S-, when S crashes           
+    def receive(msg=('respHandlePredCrash', sentRequestsLen, newPred), from_=newSucc):
+        send(('handleSuccCrash', sentRequestsLen, newSucc), to=newPred)
+     
+    # Final phase for chain extension. Master reconfigures chain with new tail and informs the client   
+    def receive(msg=('ackSetBalanceAndTransMap',(bankName, currTail, newTail, master)), from_=inNewTail):
+        output("EXTENDCHAIN Chain extension successful. Reconfiguring Server Chain and Updating master maps for ",bankName)
+        # Inform CurrTail about its new successor
+        send(('setSucc', newTail), to=currTail)
+        # Update Master's Maps
+        updateBankServersPingMap(bankName, newTail)
+        updateBankHeadTailMap(bankName, newTail, "tail")
+        (currTailPred, ignore) = bankPredSuccMap[(bankName,currTail)]
+        bankPredSuccMap[(bankName,currTail)] = (currTailPred, newTail)
+        bankPredSuccMap[(bankName,newTail)] = (currTail, None)
+        
+        output("EXTENDCHAIN Chain extension successful. Updated Master Maps BHTM : ",bankHeadTailMap, " BPSM : ",bankPredSuccMap)
+        # Bank's client should be informed about the new tail, once the old tail forwards all the updates to new tail
+        if bankName in bankClientsMap:
+            clientList = bankClientsMap[bankName]
+            for client in clientList:
+                send(('tail', newTail), to=client)
+     
+    # update bank head tail map   
+    def updateBankHeadTailMap(bankName, serverPid, serverType):
+        if serverType == "head":
+            if bankName in bankHeadTailMap:
+                (oldHead, oldTail) = bankHeadTailMap[bankName]
+                bankHeadTailMap[bankName] = (serverPid, oldTail)
+            else:
+                bankHeadTailMap[bankName] = (serverPid, None)
+        elif serverType == "tail":
+            if bankName in bankHeadTailMap:
+                (oldHead, oldTail) = bankHeadTailMap[bankName]
+                bankHeadTailMap[bankName] = (oldHead, serverPid)
+            else:
+                bankHeadTailMap[bankName] = (None, serverPid)
+        else:
+            pass
+     
+    # update bank server ping map       
+    def updateBankServersPingMap(bankName, serverPid):
+        bankServersPingMap[(bankName, serverPid)] = round(time.time())
+        
+    def takeServerFailureAction(bankName, failedServerPid):
+        if bankName in bankHeadTailMap:
+            (bankHeadPid, bankTailPid) = bankHeadTailMap[bankName]
+            # head failure
+            if bankHeadPid == failedServerPid:
+                output("Head Crash Detected for the bank: ",bankName," Crashed Head : ",failedServerPid,'\n')
+                printEssentialState("State Before Head Crash handling for bank : "+bankName)
+                # Remove from pingmap
+                del bankServersPingMap[(bankName,failedServerPid)]
+                # Get failed server's successor and predecessor. This successor will be new head. 
+                (ignore, newHeadPid) = bankPredSuccMap[(bankName, failedServerPid)]
+                # Delete failed server's entry in bankPredSuccMap
+                del bankPredSuccMap[(bankName, failedServerPid)]
+                # Change New Head's entry. New Head's previous predecessor is current failed server
+                (ignore, nHeadSucc) = bankPredSuccMap[(bankName, newHeadPid)]
+                bankPredSuccMap[(bankName, newHeadPid)] = (None, nHeadSucc)
+                # Inform the new head about the change in its predecessor
+                send(('setPred', None), to=newHeadPid)
+                # Update the bank's head tail map
+                bankHeadTailMap[bankName] = (newHeadPid, bankTailPid)
+                # Announce the change to all the bank's clients
+                if bankName in bankClientsMap:
+                    clientList = bankClientsMap[bankName]
+                    for clientPid in clientList:
+                        send(('head',newHeadPid), to=clientPid)
+                
+                printEssentialState("State After Head Crash handling for bank :"+bankName)
+            # tail failure
+            elif bankTailPid == failedServerPid:
+                output("Tail Crash Detected for the bank: ",bankName," Crashed Tail : ",failedServerPid,'\n')
+                printEssentialState("State Before Tail Crash handling for bank : "+bankName)
+                # Remove from pingmap
+                del bankServersPingMap[(bankName,failedServerPid)]
+                # Get failed server's successor and predecessor. This predecessor will be new tail. 
+                (newTailPid, ignore) = bankPredSuccMap[(bankName, failedServerPid)]
+                # Delete failed server's entry in bankPredSuccMap
+                del bankPredSuccMap[(bankName, failedServerPid)]
+                # Change New Tail's entry. New Tail's previous successor is current failed server
+                (nTailPred, ignore) = bankPredSuccMap[(bankName, newTailPid)]
+                bankPredSuccMap[(bankName, newTailPid)] = (nTailPred, None)
+                # Inform the new tail about the change in its successor
+                send(('setSucc', None), to=newTailPid)
+                # Update the bank's head tail map
+                bankHeadTailMap[bankName] = (bankHeadPid, newTailPid)
+                # Announce the change to all the bank's clients
+                if bankName in bankClientsMap:
+                    clientList = bankClientsMap[bankName]
+                    for clientPid in clientList:
+                        send(('tail',newTailPid), to=clientPid)
+                
+                # Inform the new tail to take new tail actions - Pop and delegate sent requests
+                send('takeNewTailAction', to=newTailPid),
+                
+                printEssentialState("State After Tail Crash handling for bank :"+bankName)
+            # mid server crash
+            else:
+                output(" MIDCRASHHANDLING Mid Server Crash Detected for the bank: ",bankName," Crashed Server : ",failedServerPid,'\n')
+                printEssentialState(" MIDCRASHHANDLING State Before Mid Server Crash handling for bank : "+bankName)
+                # Remove from pingmap
+                del bankServersPingMap[(bankName,failedServerPid)]
+            
+                # Get failed server's successor and predecessor. Delete after it
+                (failedSerPred, failedServerSucc) = bankPredSuccMap[(bankName,failedServerPid)]
+                del bankPredSuccMap[(bankName,failedServerPid)]
+            
+                # Update Pred Succ Map for failed server's predecessor and successor
+                (fPP, ignore) = bankPredSuccMap[(bankName,failedSerPred)]
+                (ignore, fSS) = bankPredSuccMap[(bankName,failedServerSucc)]
+                bankPredSuccMap[(bankName,failedSerPred)] = (fPP, failedServerSucc)
+                bankPredSuccMap[(bankName,failedServerSucc)] = (failedSerPred, fSS)
+                
+                # Inform FailedSerPred and FailedServerSucc about new neighbours
+                send(('setSucc',failedServerSucc), to=failedSerPred)
+                send(('setPred',failedSerPred), to=failedServerSucc)
+            
+                # Handle sent requests inconsistency
+                send(('handlePredCrash',failedSerPred), to=failedServerSucc)
+                
+                printEssentialState(" MIDCRASHHANDLING State After Mid Server Crash handling for bank :"+bankName)
+     
+    # Returns chain length for a bank       
+    def getBankChainLength(bankName):
+        chainLength = 0
+        for (bName, server) in bankServersPingMap:
+            if bName == bankName:
+                chainLength += 1
+        return chainLength
+
+    # Extend the server chain for the bank by adding new server
+    def extendServerChain(bankName):
+        output(" EXTENDCHAIN Extending chain for the bank : ",bankName,'\n')
+        (ignore, currTail) = bankHeadTailMap[bankName]
+        
+        # Creating new server. Inform the server about its pred and succ. But do not update the master maps, as of now
+        psSet = new(server.Server, num= 1)
+        psList = list(psSet)
+        if self.extTailFailure == "true":
+            crashType = ["receive",2]
+        else:
+            crashType = ["unbounded",0]
+        setup(psList[0], ({}, {'pred':currTail,'succ':None,'serverType':"tail",'bankname':bankName, 
+                               'crashType':crashType, 'master':self.id, 'register':False, 'simulate_msg_loss':"false"}))
+        start(psSet)
+        
+        #Inform currtail about its possibly lost tail status and forward all the sentRequests to new tail
+        newTail = psList[0]
+        send(('takeOldTailAction', bankName, currTail, newTail), to=currTail)
+        
+        #         Further flows between Servers and Masters
+        #         Master to CurrTail -> takeOldTailAction
+        #         CurrTail to NewTail -> setBalanceAndTransMap
+        #         NewTail to Master -> ackSetBalanceAndTransMap = Update Master maps, set successor and inform clients
+          
+            
+    def printEssentialState(msg):
+        output(msg,'\n')
+        output("Master : BankHeadTailMap : ",bankHeadTailMap,'\n')
+        output("Master : BankServersPingMap : ",bankServersPingMap,'\n')
+        output("Master : BankPredSuccMap : ",bankPredSuccMap,'\n')
+        
+    
+    def main():
+        
+        actionSet = new(actionprocess.ActionProcess, num=2)
+        actionList = list(actionSet)
+        setup(actionList[0], ({},{'delay':15,'action':'checkForFailedServers','srcPid':self.id,'destPid':self.id}))
+        setup(actionList[1], ({},{'delay':15,'action':'checkForChainLength','srcPid':self.id,'destPid':self.id}))
+        start(actionSet)
+        
+        output("Master awaited : ",self.id,'\n')
+        if await(False):
+            pass
+        elif timeout(100):
+            output("Master terminating : ",self.id,'\n')
+        
+def main():
+    pass

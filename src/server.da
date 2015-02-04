@@ -1,0 +1,249 @@
+import sys
+import actionprocess
+import time
+import random
+import math
+
+class Server(process):
+    #Setup process for a server
+    def setup(ps, argsMap):
+        self.myName = argsMap['bankname']
+        self.crashType = argsMap['crashType']
+        self.serverType = argsMap['serverType']
+        self.register = argsMap['register']
+        self.simulateMsgLoss = argsMap['simulate_msg_loss']
+        
+        self.balanceMap = {}
+        self.processedTransMap = {}
+        self.sentRequests = []
+        
+        self.pred = argsMap['pred']
+        self.succ = argsMap['succ']
+        self.master = argsMap['master']
+        
+        # constants
+        self.processed = "processed"
+        self.inconsistent = "inconsistentWithHistory"
+        self.insufficient = "insufficientBalance"
+        self.deposit = "deposit"
+        self.withdraw = "withdraw"
+        
+        self.crashCounter = 1
+        
+    #Handler function for setting predecessor for a server
+    def receive(msg=('setPred', pred), from_=source):
+        output("Setting Predecessor for ",self.id, " as ",pred,'\n')
+        self.pred = pred
+    
+    #Handler function for setting successor for a server    
+    def receive(msg=('setSucc', succ), from_=source):
+        output("Setting Successor for ",self.id, " as ",succ,'\n')
+        self.succ = succ
+        
+    #Handler function for getBalance request from a client. Received by the chain's tail
+    def receive(msg=('getBalance', reqId, accountNum), from_=client):
+        output("Received getBalance request ",str(reqId)," from client ",client, " by ",self.id,'\n')
+        result = getBalance(reqId, accountNum)
+        send(('result',result), to=client)
+        updateCrashCounter("receive")
+    
+    def receive(msg=('deposit', reqId, accountNum, amount), from_=client):
+    #Handler function for deposit request from a client. Received by the chain's head    
+        output("Received deposit request ",str(reqId)," from client ",client, " by ",self.id,'\n')
+        (result, pTransObj) = depositAmount(reqId, accountNum, amount)
+        sync(result, client, accountNum, pTransObj)
+        updateCrashCounter("receive")
+        
+    #Handler function for withdraw request from a client. Received by the chain's head
+    def receive(msg=('withdraw', reqId, accountNum, amount), from_=client):
+        output("Received withdraw request ",str(reqId)," from client ",client, " by ",self.id,'\n')
+        (result, pTransObj) = withdrawAmount(reqId, accountNum, amount)
+        sync(result, client, accountNum, pTransObj)
+        updateCrashCounter("receive")
+        
+    #Handler function for sync request. Received by a server from its predecessor
+    def receive(msg=('sync', result, clientPid, accountNum, pTransObj), from_=server):
+        output("Received sync request ", result[0]," from ",server, " by ",self.id,'\n')
+        if server == self.pred :
+            updateBalanceAndTransactionMaps(accountNum, result, pTransObj)
+            sync(result, clientPid, accountNum, pTransObj)
+        else:
+            output("Chain corrupted ! :) Time to grab some coffee!!",'\n')
+        updateCrashCounter("receive")
+      
+    # Handle sentRequests ack received from successor
+    def receive(msg=('sentRequestsAck',result, clientPid, accountNum, pTransObj), from_=successor):
+        self.sentRequests.remove((result, clientPid, accountNum, pTransObj))
+        if self.pred != None:
+                send(('sentRequestsAck',result, clientPid, accountNum, pTransObj), to=self.pred)
+    
+    
+    # When a server becomes tail after its successor's failure
+    def receive(msg='takeNewTailAction', from_=master):
+        output("Taking new tail action. Current SentRequests : ",self.sentRequests,'\n')
+        for (result, clientPid, accountNum, pTransObj) in self.sentRequests:
+            # Resend responses to client, even if it is duplicate. Availability matters ;)
+            send(('result', result), to=clientPid)
+            # Send all the sentRequests to predecessor
+            if self.pred != None:
+                send(('sentRequestsAck',result, clientPid, accountNum, pTransObj), to=self.pred)
+
+    # When a tail becomes mid server after a new tail becomes its successor
+    def receive(msg=('takeOldTailAction', bankName, currTail, newTail), from_=master):
+        output(" EXTENDCHAIN To be old tail sending BalanceMap and TransMap to New Tail : ",newTail)
+        send(('setBalanceAndTransMap', self.balanceMap, self.processedTransMap, (bankName, currTail, newTail, master)), to= newTail)
+        updateCrashCounter("receive_ext")
+
+    # When new tail receives the BalanceMap and ProcessedTransMap
+    def receive(msg=('setBalanceAndTransMap', inBalanceMap, inProcessedTransMap, (bankName, currTail, newTail, master)), from_=server):
+        output("EXTENDCHAIN Receiving BalanceMap and TransMap from Old Tail : ",currTail," BalanceMap : ",inBalanceMap," TransMap : ",inProcessedTransMap)
+        self.balanceMap = inBalanceMap
+        self.processedTransMap = inProcessedTransMap
+        send(('ackSetBalanceAndTransMap',(bankName, currTail, newTail, master)), to=master)
+        updateCrashCounter("receive")
+    
+    # S+ sends its sent requests index to master on master's request
+    def receive(msg=('handlePredCrash',myNewPred), from_=master):
+        output("MIDCRASHHANDLING Received handlePredCrash from master for my new pred : ",myNewPred,"\n")
+        sentRequestsLen = len(self.sentRequests)
+        send(('respHandlePredCrash', sentRequestsLen, myNewPred), to=master)
+        updateCrashCounter("receive_fail")
+        
+    # S- sends the suffix list of sent requests to S+, as requested by master
+    def receive(msg=('handleSuccCrash', sentRequestsLen, newSucc), from_=master):
+        if len(self.sentRequests) > sentRequestsLen:
+            # Getting nth tail from the list. Python syntax a[-n:]
+            sentRequestsSuffix = self.sentRequests[(sentRequestsLen-len(self.sentRequests)):]
+            output("MIDCRASHHANDLING Sending SentrequestsSuffixList to my new successor : ",newSucc," : ",sentRequestsSuffix,'\n')
+            send(('processNoAckRequests', sentRequestsSuffix), to=newSucc)
+        else:
+            output("MIDCRASHHANDLING No SentrequestsSuffixList to be sent to my new successor : ",newSucc,'\n')
+        updateCrashCounter("receive_fail")
+    
+    # S+ on receiving the sent requests suffix list, uppdates the map and propagates the list contents to its successor
+    def receive(msg=('processNoAckRequests', sentRequestsSuffix), from_=pred):
+        output("MIDCRASHHANDLING Received SentrequestsSuffixList from my new predecessor : ",pred," : ",sentRequestsSuffix,'\n')
+        for (result, clientPid, accountNum, pTransObj) in sentRequestsSuffix:
+            updateBalanceAndTransactionMaps(accountNum, result, pTransObj)
+            sync(result, clientPid, accountNum, pTransObj)
+    
+ 
+    # Communication APIs
+    
+    #Function used by server to forward a sync request to the successor, or to send the result to the client if it is the tail
+    def sync(result, clientPid, accountNum, pTransObj):
+        if self.succ is not None:
+            send(('sync', result, clientPid, accountNum, pTransObj), to=self.succ)
+            # Appending sent requests for mid server crash handling
+            if (result, clientPid, accountNum, pTransObj) not in self.sentRequests:
+                self.sentRequests.append((result, clientPid, accountNum, pTransObj))
+        else:
+            if shallDropRequest(self.simulateMsgLoss):
+                output("RESEND Dropping result to client to simulate message loss : ",result,'\n')
+            else:
+                output("Sending result to client ",clientPid, " by ",self.id, " : ", result,'\n')
+                send(('result',result), to=clientPid)
+            # Sending ack to predecessor, to inform this request is processed
+            if self.pred != None:
+                send(('sentRequestsAck',result, clientPid, accountNum, pTransObj), to=self.pred)  
+        updateCrashCounter("send")
+    
+    # server checks whether to simulate message loss
+    def shallDropRequest(simulateMsgLoss):
+        if simulateMsgLoss == "true":
+            random.seed(round(time.time()))
+            r = random.random()
+            if r < 0.5:
+                return True
+            else:
+                return False
+        else:
+            return False
+    
+    #Function used by server to update it's balanceMap and processedTransMap
+    def updateBalanceAndTransactionMaps(accountNum, result, pTransObj):
+        if (result[1] == self.processed) and (pTransObj != ()):
+            balanceMap[accountNum] = result[3]
+        if pTransObj != ():
+            processedTransMap[result[0]] = pTransObj
+        #output("Updated BalanceMap and TransMap at : ", self.id, " are ", (balanceMap, processedTransMap),'\n')
+    
+    # Update crash counter
+    def updateCrashCounter(event):
+        [crashT, n] = self.crashType
+        if event == crashT:
+            self.crashCounter += 1
+            output("CrashCounter Status for bank : ",self.myName," : ",self.crashCounter)
+    
+    # Bank APIs
+        
+    #Function returning the current balance of an account
+    def currBalance(accountNum):
+        if accountNum in balanceMap :
+            balance = balanceMap[accountNum]
+        else:
+            balanceMap[accountNum] = 0
+            balance = 0
+        return balance
+    
+    #Function to perform the getBalance() request
+    def getBalance(reqId, accountNum):
+        return (reqId, self.processed, accountNum, currBalance(accountNum))
+    
+    #Function to perform the deposit() request
+    def depositAmount(reqId, accountNum, amount):
+        balance = currBalance(accountNum)
+        if reqId not in self.processedTransMap:
+            balanceMap[accountNum] = balance + amount
+            transObj = (reqId, accountNum, (amount, balance + amount, self.processed ), self.deposit)
+            processedTransMap[reqId] = transObj
+            return ((reqId, self.processed, accountNum, balance + amount), transObj)
+        else:
+            (pReqId, pAccountNum, (pAmount, pRepliedBalance, pRepliedType), transType)  = processedTransMap[reqId]
+            if (pAccountNum, pAmount, transType) == (accountNum, amount, self.deposit):
+                return ((reqId, pRepliedType, accountNum, pRepliedBalance),())
+            else:
+                return ((reqId, self.inconsistent, accountNum, balance),())
+            
+    #Function to perform the withdraw() request
+    def withdrawAmount(reqId, accountNum, amount):
+        balance = currBalance(accountNum)
+        if reqId not in self.processedTransMap:
+            if balance >= amount:
+                balanceMap[accountNum] = balance - amount
+                transObj = (reqId, accountNum, (amount, balance - amount, self.processed ), self.withdraw)
+                processedTransMap[reqId] = transObj
+                return ((reqId, self.processed, accountNum, balance - amount), transObj)
+            else:
+                transObj = (reqId, accountNum, (amount, balance, self.insufficient), self.withdraw)
+                processedTransMap[reqId] = transObj
+                return ((reqId, self.insufficient, accountNum, balance), transObj)
+        else :
+            (pReqId, pAccountNum, (pAmount, pRepliedBalance, pRepliedType), transType)  = processedTransMap[reqId]
+            if (pAccountNum, pAmount, transType) == (accountNum, amount, self.withdraw):
+                return ((reqId, pRepliedType, accountNum, pRepliedBalance),())
+            else:
+                return ((reqId, self.inconsistent, accountNum, balance),())
+      
+    #Server waits for receiving query and update requests by timing out for 120 seconds  
+    def main():
+        if self.register:
+            send(('registerServer', self.myName, self.serverType), to=self.master)
+            send(('registerPredSucc', self.myName, self.pred, self.succ), to=self.master)
+        
+        # Spawning ping process
+        actionSet = new(actionprocess.ActionProcess, num=1)
+        actionList = list(actionSet)
+        setup(actionList[0], ({},{'delay':1,'action':'pingMaster','srcPid':self.id,'destPid':self.master, 'bankName':self.myName}))
+        start(actionSet)
+        
+        output("Server awaited : ",self.id,'\n')
+        [crashT, n] = self.crashType
+        if await(n == self.crashCounter):
+            send('kill', to=actionList[0])
+            output("Server", self.myName, "terminating due to the constraint : ",self.crashType,'\n')
+        elif timeout(100):
+            output("Server", self.myName, "terminating due to timeout : ",self.id,'\n')
+        
+def main():
+    pass

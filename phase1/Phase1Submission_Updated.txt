@@ -1,0 +1,705 @@
+Asynchronous Systems - Assignment
+=================================
+
+Ashwin Giridharan (100930400) - Wrote the pseudocode and design approach for transfers
+Balaji Srinivasan (109969253) - Will start contributing from Phase 2
+
+Phase 1.a - Pseudocode
+======================
+
+Convention
+1. ! -> Send event
+2. !* -> Blocking send. Wait for reply
+
+Process Server
+{
+
+#Map of {reqId, {accountNum, amount, Type}}
+var processedTransMap => {}
+
+#Map of {accountNum, balance}
+var balanceMap => {}
+
+var successor, predecessor, master
+
+# To propagate unprocessed updates during mid server crash
+var sentRequests = []
+
+function main()
+	pingMaster()
+	checkForPendingRequests()
+
+# Send keep alive packets
+function pingMaster()
+	master ! ping
+	sleep(3)
+	pingMaster()
+
+# To handle when this server takes over as new tail
+# Function executed only by tail of a chain
+function checkForPendingRequests()
+	if(successor == null) # Check if am tail
+		for  requests in sentRequests
+			case requests of
+				# To handle when this server takes over as new tail. Send ack for all local pending requests
+				(result, client, accountNum, processedTransObj) ->
+					sentRequests.delete((result, client, accountNum, processedTransObj))
+					if(null != predecessor)
+						predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+			end
+	sleep(5)
+	checkForPendingTransfers()
+	
+# Receive ack for sentRequests and propagate to predecessor- To handle mid server crash 
+event receive("sentRequestsAck", (result, client, accountNum, processedTransObj)) from next
+	if successor == next
+		sentRequests.delete((result, client, accountNum, processedTransObj))
+		if(null != predecessor)
+			predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+
+# Update Predecessor and Successor
+event receive("predSucc", (newPred, newSucc)) from master
+	predecessor = newPred
+	successor = newSucc
+
+event receive("pred", newPred) from master
+	predecessor = newPred
+	
+event receive("succ", newSucc) from master
+	successor = newSucc
+	
+# Handle Predecessor Crash in mid server failure scenario
+event receive("handlePredCrash", midPred) from master
+	mySentRequestsIndex = getLastIndex(sentRequests)
+	master ! ("respHandlePredCrash", mySentRequestsIndex, midPred)
+	
+# Handle Successor crash in mid server failure scenario
+event receive("handleSuccCrash", sentRequestsIndex, midSucc) from master
+	suffixSentRequestsList = getSuffixList(sentRequests, sentRequestsIndex)
+	midSucc ! ("processNoAckRequests", suffixSentRequestsList)
+
+# Process all the requests in suffix list - Mid server crash scenario
+event receive("processNoAckRequests", suffixSentRequestsList) from midPred
+	for (result, client, accountNum, processedTransObj) in suffixSentRequestsList
+		# Is midPred my predecessor check required?
+		updateAccountBalance(accountNum, result)
+		updateProcessedTransObj(result.reqId, processedTransObj)
+		sync(result, (client, accountNum, processedTransObj))
+
+# This Query event will be received by the tail
+event receive("getBalance", (accountNum)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	result = getBalance(reqID, accountNum)
+	client ! ("response", result)
+
+# This Update event will be received by head	
+event receive("deposit", (accountNum, amount)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	{result, processedTransObj} = deposit(reqID, accountNum, amount)
+	sync(result, (client, accountNum, processedTransObj))
+	
+# This Update event will be received by head	
+event receive("withdraw", (accountNum, amount)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	{result,processedTransObj} = withdraw(reqID, accountNum, amount)
+	sync(result, (client, accountNum, processedTransObj))
+
+# Sync event received ideally from its predecessor
+event receive("sync", (result, client, accountNum, processedTransObj)) from prev
+	if(predecessor == prev)
+		updateAccountBalance(accountNum, result)
+		updateProcessedTransObj(result.reqId, processedTransObj)
+		sync(result, (client, accountNum, processedTransObj))
+		
+# Propagates update to next server ( if available); else send response back to client	
+function sync(result, (client, accountNum, processedTransObj))
+	if(successor != null)
+		successor ! ("sync", (result, client, accountNum, processedTransObj))
+		sentRequests.append((result, client, accountNum, processedTransObj)) # result.tup(0) gives reqId
+	else
+		# Client may get a duplicate reply - in mid server crash - suffixList propagation scenario
+		client ! ("response", result)
+		predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+
+# Update already computed value from predecessor
+function updateAccountBalance(accountNum, result)
+	case result of
+		(_,_,newBalance) ->
+			balanceMap[accountNum] = newBalance
+		_ ->
+			"ignore"
+	end
+	
+function updateProcessedTransObj(reqId, processedTransObj)
+	if processedTransObj != {}
+		processedTransMap.put(reqId, processedTransObj)
+	
+# Banking APIs
+function getBalance(reqID, accountNum): 
+	balance = 
+		case balanceMap[accountNum] of
+			null ->
+				balanceMap.put(accountNum,0)
+				0
+			bal ->
+				bal
+		end
+	return {reqID, Processed, balance}
+
+function deposit(reqID, accountNum, amount)
+	if balanceMap[accountNum] == null
+		balanceMap.put(accountNum,0)
+	if(null != (tranObj = processedTransMap.get(reqid)))
+		if( transObj.equals({accountNum, amount, 'D'})
+			return {getBalance(reqID, accountNum),{}}
+		else
+			return {getBalance(reqID, accountNum).replaceWith(Processed, InconsistentWithHistory),{}}
+	else
+		newBalance = updateBalance(accountNum, amount, 'D')
+		processedTransMap.put(reqId, {accountNum, amount, 'D'})
+		return {{reqId, Processed, newBalance}, {accountNum, amount, 'D'}}
+
+function withdraw(reqID, accountNum, amount)
+	if balanceMap[accountNum] == null
+		balanceMap.put(accountNum,0)
+	if(null != (tranObj = processedTransMap.get(reqid)))
+		if( transObj.equals({accountNum, amount, 'W'})
+			return {getBalance(reqID, accountNum), {}}
+		else
+			return {getBalance(reqID, accountNum).replaceTupleWith(Processed, InconsistentWithHistory), {}}
+	else
+		if(getBalance(reqID, accountNum) >= amount)
+			newBalance = updateBalance(accountNum, amount, 'W')
+			processedTransMap.put(reqId, {accountNum, amount, 'W'})
+			return {{reqId, Processed, newBalance},{accountNum, amount, 'W'}}
+		else
+			return {getBalance(reqID, accountNum).replaceTupleWith(Processed, InsufficientFunds),{}}
+			
+function updateBalance(accountNum, amount, Type)
+	if (Type == 'W')
+		balanceMap[accountNum] -= amount
+	else
+		balanceMap[accountNum] += amount
+		return amount
+			
+} # Process Server Ends
+
+------------------------------------------------------------------------------------------------------
+
+Process Client
+{
+# Stores the head and tail of the server chain
+var bankHeadTailMap = {{bank1,(head,tail)}, ..{bankn,(head,tail)}}
+
+event receive("head", bank, newHead) from master
+	updateBankHeadTailMap(bankHeadTailMap, "head", bank, newHead)
+	
+event receive("tail", bank, newTail) from master
+	updateBankHeadTailMap(bankHeadTailMap, "tail", bank, newTail)
+	
+	
+} # Process Client ends here
+
+--------------------------------------------------------------------------------------------------------
+
+Process Master
+{
+
+# pingMap - Store servers' ping time and used to remove a server when no response received for 15 seconds
+var pingMap = {{bank1,((server1, 0),.. (servern,0))}, .. {bankn,((server1, 0),.. (servern,0))}}
+
+var bankHeadTailMap = {{bank1,(head,tail)}, ..{bankn,(head,tail)}}
+
+var clientList
+
+# The servers will send ping for every 3 seconds
+event receive(ping) from server
+	currTime = getCurrentTimeInSecs()
+	pingMap.put(server, currTime)
+
+# Receive requestSentIndex in mid server failure scenario
+event receive("respHandlePredCrash", sentRequestsIndex, midPred) from midSucc
+	midPred ! ("handleSuccCrash", sentRequestsIndex, midSucc)
+	
+function main()
+	checkForFailedServers()
+	checkChainLength()
+	
+function checkForFailedServers()
+	for bank, servers in pingMap
+		for server, lastPing in servers
+			if (getCurrentTimeInSecs() - lastPing) > 15
+				spawn(takeServerFailureAction(bank, server))
+	sleep(15)
+	checkForFailedServers()
+  
+function takeServerFailureAction(bank, failedServer)
+	#Handle Head Failure
+	if(isHead(bankHeadTailMap, bank, failedServer))
+		removeBankServerFromPingMap(pingMap, bank, failedServer)
+		newHead = getFirstElem(pingMap, bank)
+		updateBankHeadTailMap(bankHeadTailMap, "head", bank, newHead)
+		newHead ! ("pred", null)
+		for client in clientList
+			client ! ("head", bank, newHead)
+		
+		
+	#Handle Tail Failure
+	elif (isTail(bankHeadTailMap, bank, failedServer))
+		removeBankServerFromPingMap(pingMap, bank, failedServer)
+		newTail = getLastElem(pingMap, bank)
+		updateBankHeadTailMap(bankHeadTailMap, "tail", bank, newTail)
+		newTail ! ("succ", null)
+		for client in clientList
+			client ! ("tail", bank, newTail)
+		
+		
+	#Handle Mid server Failure
+	else
+		midPred = getPredecessor(pingMap, bank, failedServer)
+		midSucc = getSuccessor(pingMap, bank, failedServer)
+		removeBankServerFromPingMap(pingMap, bank, failedServer)
+		midPred !* ("succ", midSucc) # It is safe to ensure, that both new succ and pred are aware of each other before handling SentRequests sync
+		midSucc !* ("pred", midPred) # It is safe to ensure, that both new succ and pred are aware of each other before handling SentRequests sync
+		midSucc ! ("handlePredCrash", midPred)
+ 
+# Extend a bank's server chain based on total servers / expected servers threshold
+# The case of forwarding the updates and the handling of SentRequests are  taken care in Server's sync function
+function extendChain(bank)
+	# TODO - Make old tail to send update history to new tail
+	newTail = spawnNewInstance(bank)
+	oldTail = getLastElem(pingMap, bank)
+	appendTailToPingMap(pingMap, bank, newTail)
+	updateBankHeadTailMap(bankHeadTailMap, "tail", bank, newTail)
+	oldTail ! ("succ", newTail)
+	newTail ! ("predSucc", (oldTail, null))
+	for client in clientList
+			client ! ("tail", bank, newTail)
+
+# Checks if all bank servers have desired chain length and extend them if required
+function checkChainLength()
+	for bank, servers in pingMap
+		if servers.length < THRESHOLD
+			spawn(extendChain(bank))
+	sleep(30)
+	checkChainLength() 
+ 
+	
+} # Process Master ends here
+
+
+=======================================================================================================================================================
+
+Phase 1.b - Transfer Design Approach and Proof Of Correctness
+-------------------------------------------------------------
+
+Transfer Design Approach
+------------------------
+
+1. When transfer request is received by the head of source bank from clientA
+	a. source.head performs withdraw operation for clientA
+	b. A transfer entry is added to the sentRequests of source.head.
+	c. The result of withdraw is propagated to the servers across the chain.
+		A transfer entry is added to the sentRequests of each of the server
+	d. When source.tail receives the transfer-withdraw request, 
+		it sends a deposit request to dest bank's head, along with client process id, amount, destAccountNum.
+		Further source.tail requests dest.head for propagation acknowledgement.
+	e. When dest.head propagates the transfer to next server in chain, the dest.head sends an ack
+		back to source.tail, which will delete its transfer-entry in sentRequests and propagate the ack
+		back to all servers in the chain.
+
+2. When transfer-deposit request received by dest.head
+	a. dest.head performs deposit operation for clientB.  
+	b. The result of deposit is propagated to the servers across the chain
+	c. When dest.tail receives the transfer-deposit request, it sends the success response to clientA
+	
+
+	
+Proof Of Correctness
+--------------------
+	
+As we assume that atmost t-1 servers can fail, we have atleast one server running 
+in the chains of source and destination bank. This ensures that both the withdraw
+and deposit operations will be performed for a transfer operation at the 
+respective banks and hence there will not be any inconsistency with the balance 
+amount for either of the clients
+
+Suppose when a mid-server crashes during withdraw or deposit operation, 
+the Server- will send the list of SentRequests to Server+ and hence the propagation
+continues, without affecting the transfer operation.
+
+Suppose when a source.head crashes before propagating the transfer-withdraw in 
+source bank, the client will have to retry
+
+Suppose when a dest.head crashes before propagating the transfer-deposit in 
+destination bank, then the source.tail must resend the transfer request to new head
+of the dest bank chain. To handle this, the servers of source bank maintains a 
+transfer entry in sentRequests list. A transfer-entry to sentRequests will be 
+added whenever the transfer-deposit is propagated. A transfer-entry from 
+sentRequests will be deleted, when dest head informs source tail of successful propagation. 
+When a dest head failed to acknowledge about the successful propagation then the 
+entry in source servers will remain intact. The source tail meanwhile periodically 
+iterates the transfer-entries in sentRequests list and re initiates the 
+transfer-deposit with dest head.
+
+Suppose when a source.tail crashes, still the transfer entries will be present 
+with the new tail on the source (as all servers in chain maintain transfer entries)
+and the new tail will initiate the pending transfer requests. 
+Refer checkForPendingRequests() in pseudocode.
+
+Suppose when a dest.tail crashes, the transfer-deposit request will be present in the 
+sentRequests of the new tail, which will initiate processing of these requests.
+
+==========================================================================================================
+
+Phase 1.c - Pseudocode with transfer handling
+---------------------------------------------
+Process Server
+{
+
+#Map of {reqId, {accountNum, amount, Type}}
+var processedTransMap => {}
+
+#Map of {accountNum, balance}
+var balanceMap => {}
+
+var successor, predecessor, master
+
+# To propagate unprocessed updates during mid server crash
+var sentRequests = []
+
+
+function main()
+	pingMaster()
+	checkForPendingRequests()
+
+# Send keep alive packets
+function pingMaster()
+	master ! ping
+	sleep(3)
+	pingMaster()
+
+# To handle when head of dest bank fails without propagating the transfer-deposit	
+# To handle when this server takes over as new tail
+# Function executed only by tail of a chain
+function checkForPendingRequests()
+	if(successor == null) # Check if am tail
+		for  requests in sentRequests
+			case requests of
+				# To handle when head of dest bank fails without propagating the transfer-deposit	
+				(result, client, destBank, destAccount, amount, accountNum)->
+					destBank.head ! ("depositTransfer", (result, client, destAccount, amount, accountNum))
+				# To handle when this server takes over as new tail. Send ack for all local pending requests
+				(result, client, accountNum, processedTransObj) ->
+					sentRequests.delete((result, client, accountNum, processedTransObj))
+					if(null != predecessor)
+						predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+			end
+	sleep(5)
+	checkForPendingTransfers()
+
+# Receive ack for sentRequests and propagate to predecessor- To handle mid server crash 
+event receive("sentRequestsAck", (result, client, accountNum, processedTransObj)) from next
+	if successor == next
+		sentRequests.delete((result, client, accountNum, processedTransObj))
+		if(null != predecessor)
+			predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+
+			
+# Receive ack for sentTransfer requests and propagate to predecessor- To handle mid server crash 
+event receive("sentRequestsAck", (result, client, destBank, destAccount, amount, accountNum)) from next
+	if successor == next
+		sentRequests.delete((result, client, destBank, destAccount, amount, accountNum))
+		if(null != predecessor)
+			predecessor ! ("sentRequestsAck", (result, client, destBank, destAccount, amount, accountNum))
+			
+# Update Predecessor and Successor
+event receive("predSucc", (newPred, newSucc)) from master
+	predecessor = newPred
+	successor = newSucc
+
+event receive("pred", newPred) from master
+	predecessor = newPred
+	
+event receive("succ", newSucc) from master
+	successor = newSucc
+	
+# Handle Predecessor Crash in mid server failure scenario
+event receive("handlePredCrash", midPred) from master
+	mySentRequestsIndex = getLastIndex(sentRequests)
+	master ! ("respHandlePredCrash", mySentRequestsIndex, midPred)
+	
+# Handle Successor crash in mid server failure scenario
+event receive("handleSuccCrash", sentRequestsIndex, midSucc) from master
+	suffixSentRequestsList = getSuffixList(sentRequests, sentRequestsIndex)
+	midSucc ! ("processNoAckRequests", suffixSentRequestsList)
+
+# Process all the requests in suffix list - Mid server crash scenario
+event receive("processNoAckRequests", suffixSentRequestsList) from midPred
+	for (result, client, accountNum, processedTransObj) in suffixSentRequestsList
+		# Is midPred my predecessor check required?
+		updateAccountBalance(accountNum, result)
+		updateProcessedTransObj(result.reqId, processedTransObj)
+		sync(result, (client, accountNum, processedTransObj))
+
+# This Query event will be received by the tail
+event receive("getBalance", (accountNum)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	result = getBalance(reqID, accountNum)
+	client ! ("response", result)
+
+# This Update event will be received by head	
+event receive("deposit", (accountNum, amount)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	{result,processedTransObj} = deposit(reqID, accountNum, amount)
+	sync(result, (client, accountNum,processedTransObj))
+	
+# This update event will be received by head of current bank, from tail of other bank
+event receive("depositTransfer", (result, client, destAccount, amount, accountNum)) from otherBankTail
+	{result, processedTransObj} = deposit(result.reqID, destAccount, amount)
+	sync_deposit(result, (client, destAccount, processedTransObj))
+	otherBankTail ! ("depositHeadTransfer", (result, client, destAccount, amount, accountNum, processedTransObj))
+	
+# When dest head successfully propagated the transfer, it sends an ack to source tail
+# Required by Tail of source bank for transfer operation. Tail periodically checks for any pending transfers and retries them
+event receive("depositHeadTransfer", (result, client, destAccount, amount, accountNum, processedTransObj)) from destHead
+	predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+	predecessor ! ("sentRequestsAck", (result, client, destBank, destAccount, amount, accountNum))
+	sentRequests.remove((result, client, destBank, destAccount, amount, accountNum))
+
+# This update event received from client, by head of source bank head
+event receive("transfer, (accountNum, amount, destBank, destAccount)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	{result, processedTransObj} = transfer(reqID, accountNum, amount, destBank, destAccount)
+	sync_transfer(result, (accountNum, destBank, destAccount, client, processedTransObj))
+	
+# This Update event will be received by head	
+event receive("withdraw", (accountNum, amount)) from client
+	reqID = generateUniqueId(self, client, timestamp)
+	{result,processedTransObj} = withdraw(reqID, accountNum, amount)
+	sync(result, (client, accountNum, processedTransObj))
+
+# Sync event received ideally from its predecessor
+event receive("sync", (result, client, accountNum, processedTransObj)) from prev
+	if(predecessor == prev)
+		updateAccountBalance(accountNum, result)
+		updateProcessedTransObj(result.reqId, processedTransObj)
+		sync(result, (client, accountNum, processedTransObj))
+		
+# Sync event received ideally from its predecessor for transfer-withdraw process
+event receive("syncTransfer", (result, accountNum, destBank, destAccount, client, amount, processedTransObj)) from prev
+	if(predecessor == prev)
+		updateAccountBalance(accountNum, result)
+		updateProcessedTransObj(result.reqId, processedTransObj)
+		sync_transfer(result, (accountNum, destBank, destAccount, client, amount, processedTransObj))
+
+# Sync event received ideally from its predecessor for transfer-deposit process
+event receive("syncDeposit", (result, client, destAccount, processedTransObj)) from prev
+	if(predecessor == prev)
+		updateAccountBalance(destAccount, result)
+		updateProcessedTransObj(result.reqId, processedTransObj)
+		sync_deposit(result, (client, destAccount, processedTransObj))
+		
+# Propagates update to next server ( if available); else send response back to client	
+function sync(result, (client, accountNum, processedTransObj))
+	if(successor != null)
+		successor ! ("sync", (result, client, accountNum, processedTransObj))
+		sentRequests.append((result, client, accountNum, processedTransObj)) # result.tup(0) gives reqId
+	else
+		# Client may get a duplicate reply - in mid server crash - suffixList propagation scenario
+		client ! ("response", result)
+		predecessor ! ("sentRequestsAck", (result, client, accountNum, processedTransObj))
+
+# Propagates transfer(withdraw) from head to tail of source bank
+# When tail receives the request, it forwards to head of dest bank		
+function sync_transfer(result, (accountNum, destBank, destAccount, client, amount, processedTransObj))
+	if(successor != null)
+		successor ! ("syncTransfer",(result, accountNum, destBank, destAccount, client, amount, processedTransObj))
+		sentRequests.append((result, client, accountNum,processedTransObj)) # result.tup(0) gives reqId
+	else
+		destBank.head ! ("depositTransfer", (result, client, destAccount, amount, accountNum))
+		sentRequests.append((result, client, destBank, destAccount, amount, accountNum))
+		
+
+
+# Propagates transfer(deposit) from head to tail in dest bank
+# When tail receives the request, it forwards to the client		
+function sync_deposit(result, (client, destAccount, processedTransObj))
+	if(successor != null)
+		successor ! ("syncDeposit",(result, client, destAccount, processedTransObj))
+		sentRequests.append((result, client, destAccount, processedTransObj)) # result.tup(0) gives reqId
+	else
+		client ! ("response", result)
+		predecessor ! ("sentRequestsAck", (result, client, destAccount, processedTransObj))
+
+# Update already computed value from predecessor
+function updateAccountBalance(accountNum, result)
+	case result of
+		(_,_,newBalance) ->
+			balanceMap[accountNum] = newBalance
+		_ ->
+			"ignore"
+	end
+	
+function updateProcessedTransObj(reqId, processedTransObj)
+	if processedTransObj != {}
+		processedTransMap.put(reqId, processedTransObj)
+	
+# Banking APIs
+function getBalance(reqID, accountNum): 
+	balance = 
+		case balanceMap[accountNum] of
+			null ->
+				balanceMap.put(accountNum,0)
+				0
+			bal ->
+				bal
+		end
+	return {reqID, Processed, balance}
+
+function deposit(reqID, accountNum, amount)
+	if balanceMap[accountNum] == null
+		balanceMap.put(accountNum,0)
+	if(null != (tranObj = processedTransMap.get(reqid)))
+		if( transObj.equals({accountNum, amount, 'D'})
+			return {getBalance(reqID, accountNum),{}}
+		else
+			return {getBalance(reqID, accountNum).replaceWith(Processed, InconsistentWithHistory),{}}
+	else
+		newBalance = updateBalance(accountNum, amount, 'D')
+		processedTransMap.put(reqId, {accountNum, amount, 'D'})
+		return {{reqId, Processed, newBalance}, {accountNum, amount, 'D'}}
+
+function withdraw(reqID, accountNum, amount)
+	if balanceMap[accountNum] == null
+		balanceMap.put(accountNum,0)
+	if(null != (tranObj = processedTransMap.get(reqid)))
+		if( transObj.equals({accountNum, amount, 'W'})
+			return {getBalance(reqID, accountNum), {}}
+		else
+			return {getBalance(reqID, accountNum).replaceTupleWith(Processed, InconsistentWithHistory), {}}
+	else
+		if(getBalance(reqID, accountNum) >= amount)
+			newBalance = updateBalance(accountNum, amount, 'W')
+			processedTransMap.put(reqId, {accountNum, amount, 'W'})
+			return {{reqId, Processed, newBalance},{accountNum, amount, 'W'}}
+		else
+			return {getBalance(reqID, accountNum).replaceTupleWith(Processed, InsufficientFunds),{}}
+			
+function transfer(reqID, accountNum, amount, destBank, destAccount)
+	return withdraw(reqID, accountNum, amount)
+		
+			
+function updateBalance(accountNum, amount, Type)
+	if (Type == 'W')
+		balanceMap[accountNum] -= amount
+	else
+		balanceMap[accountNum] += amount
+		return amount
+			
+} # Process Server Ends
+
+-------------------------------------------------------------------------------------------------------
+
+Process Client
+{
+# Stores the head and tail of the server chain
+var bankHeadTailMap = {{bank1,(head,tail)}, ..{bankn,(head,tail)}}
+
+event receive("head", bank, newHead) from master
+	updateBankHeadTailMap(bankHeadTailMap, "head", bank, newHead)
+	
+event receive("tail", bank, newTail) from master
+	updateBankHeadTailMap(bankHeadTailMap, "tail", bank, newTail)
+	
+	
+} # Process Client ends here
+
+--------------------------------------------------------------------------------------------------------
+
+Process Master
+{
+
+# pingMap - Store servers' ping time and used to remove a server when no response received for 15 seconds
+var pingMap = {{bank1,((server1, 0),.. (servern,0))}, .. {bankn,((server1, 0),.. (servern,0))}}
+
+var bankHeadTailMap = {{bank1,(head,tail)}, ..{bankn,(head,tail)}}
+
+var clientList
+
+# The servers will send ping for every 3 seconds
+event receive(ping) from server
+	currTime = getCurrentTimeInSecs()
+	pingMap.put(server, currTime)
+
+# Receive requestSentIndex in mid server failure scenario
+event receive("respHandlePredCrash", sentRequestsIndex, midPred) from midSucc
+	midPred ! ("handleSuccCrash", sentRequestsIndex, midSucc)
+
+function main()
+	checkForFailedServers()
+	checkChainLength()	
+
+function checkForFailedServers()
+	for bank, servers in pingMap
+		for server, lastPing in servers
+			if (getCurrentTimeInSecs() - lastPing) > 15
+				spawn(takeServerFailureAction(bank, server))
+	sleep(15)
+	checkForFailedServers()
+  
+function takeServerFailureAction(bank, failedServer)
+	#Handle Head Failure
+	if(isHead(bankHeadTailMap, bank, failedServer))
+		removeBankServerFromPingMap(pingMap, bank, failedServer)
+		newHead = getFirstElem(pingMap, bank)
+		updateBankHeadTailMap(bankHeadTailMap, "head", bank, newHead)
+		newHead ! ("pred", null)
+		for client in clientList
+			client ! ("head", bank, newHead)
+		
+		
+	#Handle Tail Failure
+	elif (isTail(bankHeadTailMap, bank, failedServer))
+		removeBankServerFromPingMap(pingMap, bank, failedServer)
+		newTail = getLastElem(pingMap, bank)
+		updateBankHeadTailMap(bankHeadTailMap, "tail", bank, newTail)
+		newTail ! ("succ", null)
+		for client in clientList
+			client ! ("tail", bank, newTail)
+		
+		
+	#Handle Mid server Failure
+	else
+		midPred = getPredecessor(pingMap, bank, failedServer)
+		midSucc = getSuccessor(pingMap, bank, failedServer)
+		removeBankServerFromPingMap(pingMap, bank, failedServer)
+		midPred !* ("succ", midSucc) # It is safe to ensure, that both new succ and pred are aware of each other before handling SentRequests sync
+		midSucc !* ("pred", midPred) # It is safe to ensure, that both new succ and pred are aware of each other before handling SentRequests sync
+		midSucc ! ("handlePredCrash", midPred)
+ 
+# Extend a bank's server chain based on total servers / expected servers threshold
+# The case of forwarding the updates and the handling of SentRequests are  taken care in Server's sync function
+# and in Server's checkForPendingRequests function
+function extendChain(bank)
+	newTail = spawnNewInstance(bank)
+	oldTail = getLastElem(pingMap, bank)
+	appendTailToPingMap(pingMap, bank, newTail)
+	updateBankHeadTailMap(bankHeadTailMap, "tail", bank, newTail)
+	oldTail ! ("succ", newTail)
+	newTail ! ("predSucc", (oldTail, null))
+	for client in clientList
+			client ! ("tail", bank, newTail)
+
+# Checks if all bank servers have desired chain length and extend them if required
+function checkChainLength()
+	for bank, servers in pingMap
+		if servers.length < THRESHOLD
+			spawn(extendChain(bank))
+	sleep(30)
+	checkChainLength()
+			
+
+} # Process Master ends here
+
+

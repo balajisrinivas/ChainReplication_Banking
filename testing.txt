@@ -1,0 +1,70 @@
+ft1.cfg
+=======
+
+Demonstrates the following,
+1. Head and Tail crash failure
+2. Master detecting failure and changing master state
+3. Clients receiving the new head and tail updates
+4. Server simulating message loss to server
+5. Client resending lost messages
+
+ft2.cfg
+=======
+Demonstrates the following,
+1. Mid Server 'S' Crash
+2. Master detecting mid server crash
+3. Master co ordinating with S- and S+ to reconfigure the chain and propagate updates
+
+
+ft3.cfg
+=======
+
+Demonstrates,
+1. Mid Server Crash
+2. Master detecting mid server crash
+3. S+ crash, while master coordinating with S- and S+ for S crash
+4. Master coordinating with S- and S++ to reconfigure the chain and propagate updates
+
+ft4.cfg
+=======
+
+Demonstrates,
+1. Mid Server Crash
+2. Master detecting mid server crash
+3. S- crash, while master coordinating with S- and S+ for S crash
+4. Master coordinating with S-- and S+ to reconfigure the chain and propagate updates
+
+ce1.cfg
+=======
+
+1. Mid server crash and reducing the chain length lesser than the threshold
+2. Master detecting mid server crash and reconfiguring chain
+3. Master detecting chain length lesser than threshold
+4. Master creates new server and makes it as new tail
+5. Master informs clients about the new tail
+
+
+ce2.cfg
+=======
+
+1. Mid server crash and reducing the chain length lesser than the threshold
+2. Master detecting mid server crash and reconfiguring chain
+3. Master detecting chain length lesser than threshold
+4. Master creates new server and makes it as new tail
+5. Master informs clients about the new tail
+6. The old tail crashes, when propagating updates to new tail
+7. Master detects the old tail failure and treats it as MID server crash failure
+8. Reconfigures the chain by eliminating the old tail
+
+ce3.cfg
+=======
+
+1. Mid server crash and reducing the chain length lesser than the threshold
+2. Master detecting mid server crash and reconfiguring chain
+3. Master detecting chain length lesser than threshold
+4. Master creates new server and makes it as new tail
+5. Master informs clients about the new tail
+6. The NEW tail crashes, when receiving updates from OLD tail
+7. Master hence retains the OLD tail as the tail of the bank
+
+	

@@ -1,0 +1,237 @@
+import sys
+import time
+import io
+import json
+import math
+import random
+from _ast import Num
+import time
+import actionprocess
+
+class Client(process):
+    
+    #Set up a client with parameters like clientID, its associated bank, bank's head and tail servers, waitTime between requests
+    def setup(ps, argsMap):
+        self.myId = argsMap['id']
+        self.bankName = argsMap['bankname']
+        self.head = argsMap['head']
+        self.tail = argsMap['tail']
+        self.timeDelay = argsMap['delay']
+        self.configPath = argsMap['configPath']
+        self.masterPid = argsMap['master']
+        self.seqNumber=0
+        self.msgTracker = {}
+    
+    #Handler function for displaying the received result from a server
+    def receive(msg=('result',result), from_=server):
+        (reqId, i1, i2, i3) = result
+        if reqId in self.msgTracker:
+            # delete message from message tracker on receiving the response
+            del self.msgTracker[reqId]
+            output("Received response",result," from server : ",len(self.msgTracker),'\n')
+     
+    # Receive updated head during failure handling and initialization   
+    def receive(msg=('head', headPid), from_=sender):
+        output("Received new head for bank ",self.bankName," : ",headPid,'\n')
+        self.head = headPid
+    
+    # Receive updated tail during failure handling and initialization      
+    def receive(msg=('tail', tailPid), from_=sender):
+        output("Received new tail for bank ",self.bankName," : ",tailPid,'\n')
+        self.tail = tailPid
+     
+    # Check for lost messages and resend it   
+    def receive(msg='checkLostMsg', from_=worker):
+        currTime = round(time.time())
+        for reqId in self.msgTracker:
+            (request, type, ts) = self.msgTracker[reqId]
+            if currTime - ts >= 15:
+                if type == "head":
+                    sPid = self.head
+                else:
+                    sPid = self.tail
+                output("RESEND Sending lost message :  ",request,'\n')    
+                send(request, to=sPid)
+            
+        
+    #Function to generate requests to the server.The requests can be randomized or itemized based on a parameter in config file
+    def generateRequests():
+        json_data=open(self.configPath)
+        data=json.load(json_data)
+        requestGenerationType=data["requestGenerationType"]
+        boolClientResendsRequests=data["ifClientResendsRequests"]
+        # This timer is given to avoid the DistAlgo using same port assignment
+        time.sleep(5)
+        if( requestGenerationType == "randomizedRequests"):
+            generateRandomRequests(boolClientResendsRequests)
+        elif(requestGenerationType == "itemizedRequests"):
+            generateItemizedRequests(boolClientResendsRequests)
+    
+    #Function to generate sequence numbers for requests
+    def getSequenceNumber():
+        seqNumber+=1
+        return seqNumber
+    
+    #Function to generate account number for a client
+    def generateAccountNumber():
+        return "acc" + self.bankName + self.myId + str(getSequenceNumber())
+
+    #Function to generate a request identifier for each request
+    def generateReqID(number):
+        return self.bankName + "." + self.myId+ "." +str(number)
+    
+    #Function to generate randomized requests to servers. The parameter specifies if some of the requests should be resent        
+    def generateRandomRequests(boolClientResendsRequests):
+        #output("Inside genRandomReq()")
+        json_data=open(self.configPath)
+        data=json.load(json_data)
+        requestParametersList=[]
+        randomizedRequestsList=[]
+        randomizedRequestsList=data["randomizedRequests"]
+        requestParametersList = randomizedRequestsList[bankName + "." + myId]
+                    
+        seed=requestParametersList[0]
+        numRequests=requestParametersList[1]
+        probBalance=requestParametersList[2]
+        probDeposit=requestParametersList[3]
+        probWithdraw=requestParametersList[4]
+        #print(seed,numRequests,probBalance, probDeposit,probWithdraw)
+        
+        numBalanceRequests=round(numRequests*probBalance)
+        numDepositRequests=round(numRequests*probDeposit)
+        numWithdrawRequests=numRequests-(numBalanceRequests+numDepositRequests)
+        #print(numBalanceRequests,numDepositRequests,numWithdrawRequests,numRequests,end='\n')
+        accNum=generateAccountNumber()
+        random.seed(seed)
+        
+        lcm=numBalanceRequests*numDepositRequests*numWithdrawRequests
+        balanceCounter=lcm/numBalanceRequests
+        depositCounter=lcm/numDepositRequests
+        withdrawCounter=lcm/numWithdrawRequests
+        
+        origBalanceCounter=balanceCounter
+        origDepositCounter=depositCounter
+        origWithdrawCounter=withdrawCounter
+       
+        
+        for j in range(lcm):
+            -- yield2
+            if(balanceCounter==0.0):
+                balanceCounter=origBalanceCounter
+                reqID=generateReqID(getSequenceNumber())
+                send(('getBalance', reqID,accNum),to=self.tail)
+                self.msgTracker[reqID] = (('getBalance', reqID,accNum), "tail", round(time.time()) )
+                awaitSleep(self.timeDelay)
+                if(boolClientResendsRequests=="true"):
+                    if(random.random()<0.2):
+                        send(('getBalance', reqID,accNum),to=self.tail)
+                        awaitSleep(self.timeDelay)
+                    else:
+                        pass
+            if(depositCounter==0.0):
+                depositCounter=origDepositCounter
+                reqID=generateReqID(getSequenceNumber())
+                randAmount=random.randint(0,10000)
+                send(('deposit', reqID, accNum, randAmount),to=self.head)
+                self.msgTracker[reqID] = (('deposit', reqID, accNum, randAmount), "head", round(time.time()) )
+                awaitSleep(self.timeDelay)
+                if(boolClientResendsRequests=="true"):
+                    if(random.random()<0.2):
+                        send(('deposit', reqID,accNum,randAmount),to=self.head)
+                        awaitSleep(self.timeDelay)
+                    else:
+                        pass
+            if(withdrawCounter==0.0):
+                withdrawCounter=origWithdrawCounter
+                reqID=generateReqID(getSequenceNumber())
+                randAmount=random.randint(0,10000)
+                send(('withdraw', reqID,accNum,randAmount),to=self.head)
+                self.msgTracker[reqID] = (('withdraw', reqID,accNum,randAmount), "head", round(time.time()) )
+                awaitSleep(self.timeDelay)
+                if(boolClientResendsRequests=="true"):
+                    if(random.random()<0.2):
+                        send(('withdraw', reqID,accNum,randAmount),to=self.head)
+                        awaitSleep(self.timeDelay)
+                    else:
+                        pass
+            balanceCounter-=1;
+            depositCounter-=1;
+            withdrawCounter-=1;
+    
+    #Function to generate itemized requests to servers. The parameter specifies if some of the requests should be resent                
+    def generateItemizedRequests(boolClientResendsRequests):
+        json_data=open(self.configPath)
+        data=json.load(json_data)
+        itemizedRequestsDict={}
+        itemizedRequestsDict=data["itemizedRequests"]
+        partreqID=self.bankName + "." + self.myId
+        reqTupleList=[]
+        reqTupleList=itemizedRequestsDict[partreqID]
+        for p in reqTupleList:
+            reqTuple=[]
+            reqTuple=p
+            reqID=partreqID+"."+str(reqTuple[0])
+            reqType=reqTuple[1]
+            accNum=reqTuple[2]
+            amount=reqTuple[3]
+            if(reqType == 'balance'):
+                send(('getBalance', reqID,accNum),to=self.tail)
+                self.msgTracker[reqID] = (('getBalance', reqID,accNum), "tail", round(time.time()) )
+                awaitSleep(self.timeDelay)
+                if(boolClientResendsRequests=="true"):
+                    if(random.random()<0.2):
+                        send(('getBalance', reqID,accNum),to=self.tail)
+                        awaitSleep(self.timeDelay)
+                    else:
+                        pass
+                
+            elif(reqType == 'deposit'):
+                send(('deposit', reqID,accNum,amount),to=self.head)
+                self.msgTracker[reqID] = (('deposit', reqID,accNum,amount), "head", round(time.time()) )
+                awaitSleep(self.timeDelay)
+                if(boolClientResendsRequests=="true"):
+                    if(random.random()<0.2):
+                        send(('deposit', reqID,accNum,amount),to=self.head)
+                        awaitSleep(self.timeDelay)
+                    else:
+                        pass
+                        
+                
+            elif(reqType == 'withdraw'):
+                send(('withdraw', reqID,accNum,amount),to=self.head)
+                self.msgTracker[reqID] = (('withdraw', reqID,accNum,amount), "head", round(time.time()) )
+                awaitSleep(self.timeDelay)
+                if(boolClientResendsRequests=="true"):
+                    if(random.random()<0.2):
+                        send(('withdraw', reqID,accNum,amount),to=self.head)
+                        awaitSleep(self.timeDelay)
+                    else:
+                        pass
+    
+    # Sleep and allow other receiver handlers to execute. Similar to yield
+    def awaitSleep(Delay):
+        if await(False):
+            pass
+        elif timeout(Delay):
+            pass   
+                    
+    #Main function for a client. Sends requests to servers and sleeps for 120 seconds to receive the responses
+    def main():
+        
+        # Spawning check lost msg process
+        actionSet = new(actionprocess.ActionProcess, num=1)
+        actionList = list(actionSet)
+        setup(actionList[0], ({},{'delay':15,'action':'checkLostMsg','srcPid':self.id,'destPid':self.id}))
+        start(actionSet)
+        
+        send(('registerClient', bankName), to=masterPid)
+        generateRequests()
+        -- yield1
+        if await(False):
+            pass
+        elif timeout(90):
+            output("Client terminating : ",bankName + "." + myId,'\n')
+            
+        
+def main():
+    pass

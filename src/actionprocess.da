@@ -1,0 +1,62 @@
+import sys
+import time
+
+class ActionProcess(process):
+    #Setup process for a server
+    def setup(ps, argsMap):
+        self.delay = argsMap['delay']
+        self.action = argsMap['action']
+        self.srcPid = argsMap['srcPid']
+        self.destPid = argsMap['destPid']
+        self.kill = False
+        if 'bankName' in argsMap:
+            self.bankName = argsMap['bankName']
+        else:
+            self.bankName = ''
+    
+    def receive(msg='kill', from_ = myspawner):
+        output("Action process received kill")
+        self.kill = True
+    
+    # Sends periodic keep alive messages to master on behalf of server
+    def pingMaster():
+        if await(self.kill == True):
+            pass
+        elif timeout(1):
+            send(('pingMaster', self.bankName, self.srcPid), to=self.destPid)
+            pingMaster()
+     
+    # Send periodic reminder to master to check for failed servers
+    def checkForFailedServers(Delay):
+        time.sleep(Delay)
+        send('checkForFailedServers', to=self.destPid)
+        checkForFailedServers(10)
+    
+    # Send periodic reminder to master to check for chain length   
+    def checkForChainLength(delay):
+        time.sleep(delay)
+        send('checkForChainLength', to=self.destPid)
+        checkForChainLength(10)
+    
+    # Send periodic reminder to client to check for lost messages    
+    def checkLostMsg(delay):
+        time.sleep(delay)
+        send('checkLostMsg', to=self.destPid)
+        checkLostMsg(delay)
+    
+        
+    def main():
+        if self.action == 'pingMaster':
+            pingMaster()
+        elif self.action == 'checkForFailedServers':
+            checkForFailedServers(self.delay)
+        elif self.action == 'checkForChainLength':
+            checkForChainLength(self.delay)
+        elif self.action == 'checkLostMsg':
+            checkLostMsg(self.delay)
+        if self.kill == True:
+            output("Action process terminating due to parent kill")
+            
+        
+def main():
+    pass
